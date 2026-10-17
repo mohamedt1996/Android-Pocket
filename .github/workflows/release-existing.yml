@@ -1,0 +1,68 @@
+name: Publish existing Android Pocket build
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/release-existing.yml']
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: android-pocket-release-v0.1.0-alpha.1
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Download the successful build (no compilation)
+        uses: actions/download-artifact@v4
+        with:
+          name: AndroidPocket
+          run-id: 39056016893
+          github-token: ${{ github.token }}
+          path: release-assets
+
+      - name: Verify and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          test -s AndroidPocket-unsigned.ipa
+          test -s INSTALL.txt
+          sha256sum --check SHA256SUMS.txt
+          unzip -tq AndroidPocket-unsigned.ipa
+          cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          Experimental Android Pocket build for iPhone/iPad running iOS 26 or later.
+
+          Assets:
+          - AndroidPocket-unsigned.ipa — unsigned iOS app with bundled ARM64 LineageOS 23.2.
+          - SHA256SUMS.txt — verify your download.
+          - INSTALL.txt — setup instructions.
+
+          Sign/sideload the IPA and enable JIT separately. First launch copies Android into writable storage; allow extra free space. Google Play services are not bundled.
+
+          Built successfully in Actions run 39056016893, from commit c16ff3b0e3207a351fcaa002342c0fcb51fe0536. This release reuses that exact build; QEMU, SPICE, graphics dependencies and the app are not rebuilt.
+
+          Experimental release: iPhone boot, LiveContainer compatibility, and graphics performance remain unverified.
+          NOTES
+          # Draft first: publish only after all uploads succeed.
+          if gh release view v0.1.0-alpha.1 --json isDraft > "$RUNNER_TEMP/release-state.json" 2>/dev/null; then
+            python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["isDraft"], "Release is already published; refusing to replace its assets"' "$RUNNER_TEMP/release-state.json"
+          else
+            gh release create v0.1.0-alpha.1 --draft --prerelease \
+              --target c16ff3b0e3207a351fcaa002342c0fcb51fe0536 \
+              --title "Android Pocket v0.1.0-alpha.1" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
+          gh release upload v0.1.0-alpha.1 AndroidPocket-unsigned.ipa SHA256SUMS.txt INSTALL.txt --clobber
+          gh release edit v0.1.0-alpha.1 --draft=false --prerelease --notes-file "$RUNNER_TEMP/release-notes.md"
+          gh release view v0.1.0-alpha.1 --json url --jq .url >> "$GITHUB_STEP_SUMMARY"
+
