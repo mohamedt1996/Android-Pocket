@@ -373,7 +373,16 @@ jobs:
           ./scripts/build_utm.sh -k iphoneos -s iOS -a arm64 -o Pocket 2>&1 | tee evidence/xcodebuild.log
           app_path="$PWD/Pocket.xcarchive/Products/Applications/UTM.app"
           test -d "$app_path"
-          /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Android Pocket' "$app_path/Info.plist"
+          python3 - "$app_path/Info.plist" <<'PYCODE'
+          import plistlib, sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          original = path.read_bytes()
+          info = plistlib.loads(original)
+          info['CFBundleDisplayName'] = 'Android Pocket'
+          fmt = plistlib.FMT_BINARY if original.startswith(b'bplist') else plistlib.FMT_XML
+          path.write_bytes(plistlib.dumps(info, fmt=fmt, sort_keys=False))
+          PYCODE
           mkdir -p staging/Payload
           cp -R "$app_path" staging/Payload/UTM.app
           # Remove stale app signature: sideloading must sign the finished payload.
