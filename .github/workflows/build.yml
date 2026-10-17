@@ -94,3 +94,396 @@ jobs:
           echo "SUPERMIN_KERNEL_VERSION=$pocket_kernel_version" >> "$GITHUB_ENV"
           echo "SUPERMIN_MODULES=/lib/modules/$pocket_kernel_version" >> "$GITHUB_ENV"
           echo "LIBGUESTFS_CACHEDIR=$RUNNER_TEMP/pocket-guestfs-cache" >> "$GITHUB_ENV"
+
+      - name: Verify guestfs appliance before editing Android
+        env:
+          LIBGUESTFS_BACKEND: direct
+          LIBGUESTFS_DEBUG: '1'
+          LIBGUESTFS_TRACE: '1'
+        run: |
+          set -euo pipefail
+          timeout 300 libguestfs-test-tool 2>&1 | tee android-evidence/guestfs-appliance.log
+
+      - name: Configure guest boot settings without mounting its filesystem on the host
+        env:
+          POCKET_RESOLUTION: ${{ inputs.resolution || '576x1024' }}
+          LIBGUESTFS_BACKEND: direct
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          import os, subprocess
+          from pathlib import Path
+          disks = list(Path('vm').rglob('vda.qcow2'))
+          assert len(disks) == 1, 'Expected one boot disk'
+          disk = str(disks[0].resolve())
+          def guest(*args, readonly=False):
+              cmd = ['guestfish'] + (['--ro'] if readonly else []) + ['-a', disk, 'run', ':'] + list(args)
+              return subprocess.check_output(cmd, text=True)
+          filesystems = guest('list-filesystems', readonly=True)
+          partitions = [line.split(':', 1)[0] for line in filesystems.splitlines() if ':' in line]
+          persist = []
+          for part in partitions:
+              try:
+                  label = guest('vfs-label', part, readonly=True).strip()
+              except subprocess.CalledProcessError:
+                  continue
+              if label.lower() == 'persist':
+                  persist.append(part)
+          assert len(persist) == 1, 'Cannot identify persist partition; refusing to alter another partition'
+          envfile = str(Path('android-evidence/grubenv').resolve())
+          guest('mount-ro', persist[0], '/', ':', 'download', '/grubenv', envfile, readonly=True)
+          subprocess.run(['grub-editenv', envfile, 'set', 'android_zram=1',
+              'android_low_perf=1', 'android_nobootanim=1', 'android_lcd_density=240',
+              'grub_timeout=2', 'kms_display_resolution='+os.environ['POCKET_RESOLUTION']], check=True)
+          # Uses upstream zRAM sizing (50% logical swap size); no kernel or driver rebuild.
+          guest('mount', persist[0], '/', ':', 'upload', envfile, '/grubenv', ':', 'sync')
+          Path('android-evidence/guest-settings.txt').write_text(
+              subprocess.check_output(['grub-editenv', envfile, 'list'], text=True))
+          PYCODE
+
+      - name: Configure iPhone VM profile and package
+        env:
+          POCKET_RAM: ${{ inputs.guest_ram || '2048' }}
+          POCKET_GRAPHICS: ${{ inputs.graphics || 'virgl' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import os, plistlib, zipfile, uuid
+          bundles = list(Path('vm').rglob('*.utm'))
+          assert len(bundles) == 1, 'Expected one .utm bundle'
+          vm = bundles[0]
+          p = vm/'config.plist'
+          c = plistlib.loads(p.read_bytes())
+          c['Information'].update(Name='Android Pocket', UUID=str(uuid.uuid4()),
+              Notes='Prebuilt LineageOS 23.2. JIT required. No iOS hypervisor. Device benchmarks needed.')
+          c['System'].update(CPU='max', CPUCount=2, ForceMulticore=True,
+              MemorySize=int(os.environ['POCKET_RAM']), JITCacheSize=128)
+          c['QEMU'].update(Hypervisor=False, TSO=False, BalloonDevice=False)
+          c['Input']['UsbSharing'] = False
+          c['Sharing']['DirectoryShareMode'] = 'None'
+          for display in c['Display']:
+              display.update(Hardware='virtio-gpu-gl-pci' if os.environ['POCKET_GRAPHICS']=='virgl' else 'virtio-gpu-pci',
+                             DynamicResolution=False, NativeResolution=False)
+          for network in c['Network']:
+              for forward in network.get('PortForward', []):
+                  forward['HostAddress'] = '127.0.0.1'
+          p.write_bytes(plistlib.dumps(c))
+          for drive in c['Drive']:
+              assert (vm/'Data'/drive['ImageName']).is_file(), 'Missing VM drive'
+          with zipfile.ZipFile('android-output/AndroidPocket-vm.zip','w',zipfile.ZIP_DEFLATED,compresslevel=1) as z:
+              for f in vm.rglob('*'):
+                  if f.is_file():
+                      z.write(f, Path('AndroidPocket.utm')/f.relative_to(vm))
+          PYCODE
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-vm
+          path: android-output/AndroidPocket-vm.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Preserve image provenance and settings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-evidence
+          path: android-evidence/
+          if-no-files-found: warn
+          retention-days: 7
+
+  ios:
+    name: Compile iOS app using existing engine
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: utmapp/UTM
+          ref: ${{ env.UTM_REV }}
+          path: utm
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Record SDK and source versions
+        working-directory: utm
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          xcodebuild -version | tee evidence/xcode.txt
+          xcrun --sdk iphoneos --show-sdk-version >> evidence/xcode.txt
+          git rev-parse HEAD > evidence/utm-revision.txt
+          cp patches/sources evidence/dependency-sources.txt
+
+      - name: Restore the exact previously compiled dependencies
+        id: sysroot
+        uses: actions/cache/restore@v4
+        with:
+          path: utm/sysroot-iOS-arm64
+          key: ${{ env.DEPENDENCY_CACHE_KEY }}
+
+      - name: Download saved dependency artifact if cache is unavailable
+        if: steps.sysroot.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-dependencies
+          path: dependency-backup
+          run-id: ${{ inputs.dependency_run_id || vars.DEPENDENCY_RUN_ID || '39053484309' }}
+          github-token: ${{ github.token }}
+
+      - name: Restore artifact or stop without rebuilding
+        if: steps.sysroot.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          if [ ! -f dependency-backup/ios-dependencies.tar.gz ]; then
+            echo '::error::The existing dependency cache is unavailable. No dependency rebuild will be attempted. Supply a run ID containing the ios-dependencies backup artifact.'
+            exit 1
+          fi
+          test "$(cat dependency-backup/cache-key.txt)" = "$DEPENDENCY_CACHE_KEY"
+          (cd dependency-backup && shasum -a 256 -c SHA256SUMS.txt)
+          tar -xzf dependency-backup/ios-dependencies.tar.gz -C utm
+
+      - name: Check restored libraries and matching SDK
+        working-directory: utm
+        run: |
+          set -euo pipefail
+          test "$(xcodebuild -version | head -n 1)" = 'Xcode 26.6'
+          test "$(xcodebuild -version | tail -n 1)" = 'Build version 17F113'
+          test "$(xcrun --sdk iphoneos --show-sdk-version)" = '26.5'
+          test -d sysroot-iOS-arm64/lib
+          test -d sysroot-iOS-arm64/include
+          test -d sysroot-iOS-arm64/Frameworks
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          root = Path('sysroot-iOS-arm64')
+          libraries = [p for p in root.rglob('*') if p.is_file()]
+          assert any('qemu' in p.name.lower() and 'aarch64' in p.name for p in libraries), 'ARM64 QEMU library missing'
+          assert any('spice' in p.name.lower() for p in libraries), 'SPICE files missing'
+          print('Using existing compiled dependencies. Rebuild path is disabled.')
+          PYCODE
+
+      - name: Save a portable backup before compiling the app
+        run: |
+          set -euo pipefail
+          mkdir -p dependency-backup
+          tar -czf dependency-backup/ios-dependencies.tar.gz -C utm sysroot-iOS-arm64
+          printf '%s\n' "$DEPENDENCY_CACHE_KEY" > dependency-backup/cache-key.txt
+          (cd dependency-backup && shasum -a 256 ios-dependencies.tar.gz > SHA256SUMS.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-dependencies
+          path: dependency-backup/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+      - name: Adapt app UI to the cached build's Xcode 26.6 SDK
+        working-directory: utm
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          def change(path, before, after):
+              p = Path(path)
+              text = p.read_text()
+              assert text.count(before) == 1, f'Unexpected upstream source: {path}'
+              p.write_text(text.replace(before, after, 1))
+          # Keep the legacy external-display implementation with the iOS 26 SDK.
+          change('Platform/iOS/UTMExternalSceneDelegate.swift',
+              '        if #available(iOS 27, *) {\n            sceneAccessory {',
+              '        #if POCKET_IOS27_SDK\n        if #available(iOS 27, *) {\n            sceneAccessory {')
+          change('Platform/iOS/UTMExternalSceneDelegate.swift',
+              '        } else {\n            self\n        }\n    }\n}',
+              '        } else {\n            self\n        }\n        #else\n        self\n        #endif\n    }\n}')
+          change('Platform/iOS/VMWindowView.swift',
+              '#if os(visionOS) || WITH_REMOTE\n        content',
+              '#if os(visionOS) || WITH_REMOTE || !POCKET_IOS27_SDK\n        content')
+          # SDK 26 retains toolbar items, without the SDK 27 priority modifier.
+          for priority in ('low', 'high'):
+              change('Platform/Shared/VMToolbarModifier.swift',
+                  '}.visibilityPriority(.'+priority+')', '}')
+          # Preserve the iOS 26 minimum required by iOSHelper AppExtensionPoint APIs.
+          # This also satisfies the app toolbar builder minimum; target phone is iOS 27.
+          change('scripts/build_utm.sh', 'CODE_SIGNING_ALLOWED=NO $TEAM_IDENTIFIER_PREFIX',
+              'CODE_SIGNING_ALLOWED=NO IPHONEOS_DEPLOYMENT_TARGET=26.0 $TEAM_IDENTIFIER_PREFIX')
+          PYCODE
+
+      - name: Add first-launch import of the bundled Android VM
+        working-directory: utm
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Platform/iOS/UTMApp.swift')
+          s = p.read_text()
+          anchor = '                .externalDisplayAccessory()'
+          assert s.count(anchor) == 1, 'Upstream app entry changed'
+          s = s.replace(anchor, anchor + '''
+                          .task {
+                              await importPocketIfNeeded()
+                          }''')
+          anchor = '    /// Identifies the window group for `openWindow`.'
+          assert s.count(anchor) == 1
+          s = s.replace(anchor, '''    @MainActor
+              private func importPocketIfNeeded() async {
+                  #if !WITH_REMOTE
+                  let key = "AndroidPocketImportedV1"
+                  guard !UserDefaults.standard.bool(forKey: key), !data.busy else { return }
+                  data.busy = true
+                  defer { data.busy = false }
+                  do {
+                      let fm = FileManager.default
+                      let dest = UTMData.defaultStorageUrl.appendingPathComponent("AndroidPocket.utm", isDirectory: true)
+                      if !fm.fileExists(atPath: dest.path) {
+                          guard let src = Bundle.main.url(forResource: "AndroidPocket", withExtension: "utm") else {
+                              throw NSError(domain: "AndroidPocket", code: 1, userInfo: [NSLocalizedDescriptionKey: "Bundled Android image is missing."])
+                          }
+                          // Copy off the main thread, then atomically move the finished bundle.
+                          let staging = UTMData.defaultStorageUrl.appendingPathComponent(".AndroidPocket-import", isDirectory: true)
+                          try await Task.detached(priority: .userInitiated) {
+                              let fm = FileManager.default
+                              try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+                              if fm.fileExists(atPath: staging.path) { try fm.removeItem(at: staging) }
+                              try fm.copyItem(at: src, to: staging)
+                              try fm.moveItem(at: staging, to: dest)
+                          }.value
+                      }
+                      await data.listRefresh()
+                      UserDefaults.standard.set(true, forKey: key)
+                  } catch {
+                      data.alertItem = .message("Android import failed: \\(error.localizedDescription). Free storage and reopen the app to retry.")
+                  }
+                  #endif
+              }
+
+          ''' + anchor)
+          p.write_text(s)
+          PY
+          git diff --binary > evidence/pocket-ios.patch
+
+      - name: Compile Release app and stage unsigned IPA payload
+        working-directory: utm
+        run: |
+          set -eo pipefail
+          ./scripts/build_utm.sh -k iphoneos -s iOS -a arm64 -o Pocket 2>&1 | tee evidence/xcodebuild.log
+          app_path="$PWD/Pocket.xcarchive/Products/Applications/UTM.app"
+          test -d "$app_path"
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Android Pocket' "$app_path/Info.plist"
+          mkdir -p staging/Payload
+          cp -R "$app_path" staging/Payload/UTM.app
+          # Remove stale app signature: sideloading must sign the finished payload.
+          rm -rf staging/Payload/UTM.app/_CodeSignature
+          rm -f staging/Payload/UTM.app/embedded.mobileprovision
+          ditto -c -k --keepParent staging/Payload ios-payload.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-payload
+          path: utm/ios-payload.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Preserve iOS build logs and patch
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-evidence
+          path: utm/evidence/
+          if-no-files-found: warn
+          retention-days: 7
+
+  package:
+    name: Assemble self-contained unsigned IPA
+    needs: [android, ios]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-vm
+          path: incoming
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-payload
+          path: incoming
+      - name: Embed Android and validate bundle contents
+        run: |
+          set -euo pipefail
+          mkdir -p staging output
+          unzip -q incoming/ios-payload.zip -d staging
+          unzip -q incoming/AndroidPocket-vm.zip -d staging/Payload/UTM.app
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+          app = Path('staging/Payload/UTM.app')
+          info = plistlib.loads((app/'Info.plist').read_bytes())
+          assert (app/info['CFBundleExecutable']).is_file()
+          vm = app/'AndroidPocket.utm'
+          cfg = plistlib.loads((vm/'config.plist').read_bytes())
+          assert cfg['System']['Architecture'] == 'aarch64'
+          assert cfg['QEMU']['Hypervisor'] is False
+          assert cfg['System']['ForceMulticore'] is True
+          for drive in cfg['Drive']:
+              assert (vm/'Data'/drive['ImageName']).is_file()
+          print('Payload layout validated. Device boot and JIT have NOT been tested.')
+          PY
+          cd staging
+          zip -q -r -1 -y ../output/AndroidPocket-unsigned.ipa Payload
+          cd ../output
+          sha256sum AndroidPocket-unsigned.ipa > SHA256SUMS.txt
+          cat > INSTALL.txt <<'TXT'
+          Android Pocket — experimental standard-runner build
+
+          Requires iOS 26 or newer.
+          1. Sign/sideload AndroidPocket-unsigned.ipa with your usual tooling.
+          2. Enable JIT for the app/container using a method supported by your iOS version.
+          3. Open the app. First launch copies the bundled Android VM into writable storage.
+             Allow room for both the embedded copy and the writable VM, plus userdata growth.
+          4. Select Android Pocket and start it. First boot can be slow.
+
+          This is a UTM-based app with a bundled LineageOS 23.2 VM, not a new emulator.
+          No physical Mac is needed; GitHub's macOS runner builds the iOS app.
+          ARM64-only guest: 32-bit-only and x86-only APKs are not supported.
+          Google services are not bundled. JIT enablement is not supplied by this IPA.
+          LiveContainer operation and graphics acceleration need on-device validation.
+
+          If VirGL fails: shut down the VM, change Display hardware to virtio-gpu-pci,
+          then reboot. This uses software rendering and may be substantially slower.
+          If iOS kills the app: lower guest RAM to 1536 MiB. zRAM does not lift iOS limits.
+          If multicore is unstable: shut down and disable Force Multicore in System settings.
+          Resolution and low-memory mode can be adjusted in the guest boot manager.
+          The preset is a starting point, not a measured fastest configuration.
+
+          Android, its kernel, VirtIO/zRAM and guest graphics drivers come from a checksum-verified prebuilt image.
+          The iOS app compiles using the previously built QEMU/SPICE/graphics dependency cache.
+          Dependency rebuilds are disabled. The ios-dependencies artifact backs up those libraries.
+          It does not implement direct iPhone GPU passthrough or unlock a hypervisor.
+          A successful Actions build validates compilation and packaging, not device boot.
+
+          Sources: https://github.com/utmapp/UTM and https://github.com/LineageOS/android
+          Android image: https://github.com/jqssun/android-lineage-qemu/releases/tag/v2026.09.17
+          See android-build-evidence and ios-build-evidence for provenance and patches.
+          Preserve upstream licenses and corresponding-source obligations if redistributing.
+          TXT
+          cat >> "$GITHUB_STEP_SUMMARY" <<'MD'
+          ## Android Pocket build artifacts
+          Download **AndroidPocket** for the unsigned IPA, checksum and install notes.
+          **android-vm** contains the separately importable VM as well.
+          **android-build-evidence** and **ios-build-evidence** contain image provenance, settings, source revisions and patches.
+
+          Compilation/packaging complete; iPhone boot, LiveContainer compatibility and
+          performance are unverified. JIT must be enabled on the device.
+          MD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AndroidPocket
+          path: output/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
