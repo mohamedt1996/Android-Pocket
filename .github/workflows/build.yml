@@ -15,6 +15,10 @@
 name: Android Pocket - standard GitHub runners
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
   workflow_dispatch:
     inputs:
       guest_ram:
@@ -77,7 +81,7 @@ jobs:
 
       - name: Configure guest boot settings without mounting its filesystem on the host
         env:
-          POCKET_RESOLUTION: ${{ inputs.resolution }}
+          POCKET_RESOLUTION: POCKET_RESOLUTION: ${{ inputs.resolution || '576x1024' }}
           LIBGUESTFS_BACKEND: direct
         run: |
           set -euo pipefail
@@ -114,8 +118,8 @@ jobs:
 
       - name: Configure iPhone VM profile and package
         env:
-          POCKET_RAM: ${{ inputs.guest_ram }}
-          POCKET_GRAPHICS: ${{ inputs.graphics }}
+          POCKET_RAM: ${{ inputs.guest_ram || '2048' }}
+          POCKET_GRAPHICS: ${{ inputs.graphics || 'virgl' }}
         run: |
           set -euo pipefail
           python3 - <<'PYCODE'
