@@ -77,7 +77,29 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libguestfs-tools grub-common
+          sudo apt-get install -y --no-install-recommends \
+            libguestfs-tools grub-common qemu-system-x86 linux-image-generic
+          # The runner's boot kernel may be absent or readable only by root.
+          # Give supermin an explicit, readable kernel and its matching modules.
+          pocket_kernel=$(find /boot -maxdepth 1 -name 'vmlinuz-*-generic' -print | sort -V | tail -n 1)
+          test -n "$pocket_kernel"
+          pocket_kernel_version="${pocket_kernel##*/vmlinuz-}"
+          test -d "/lib/modules/$pocket_kernel_version"
+          mkdir -p "$RUNNER_TEMP/pocket-guestfs" "$RUNNER_TEMP/pocket-guestfs-cache"
+          sudo install -m 0644 "$pocket_kernel" "$RUNNER_TEMP/pocket-guestfs/vmlinuz-$pocket_kernel_version"
+          echo "SUPERMIN_KERNEL=$RUNNER_TEMP/pocket-guestfs/vmlinuz-$pocket_kernel_version" >> "$GITHUB_ENV"
+          echo "SUPERMIN_KERNEL_VERSION=$pocket_kernel_version" >> "$GITHUB_ENV"
+          echo "SUPERMIN_MODULES=/lib/modules/$pocket_kernel_version" >> "$GITHUB_ENV"
+          echo "LIBGUESTFS_CACHEDIR=$RUNNER_TEMP/pocket-guestfs-cache" >> "$GITHUB_ENV"
+
+      - name: Verify guestfs appliance before editing Android
+        env:
+          LIBGUESTFS_BACKEND: direct
+          LIBGUESTFS_DEBUG: '1'
+          LIBGUESTFS_TRACE: '1'
+        run: |
+          set -euo pipefail
+          timeout 300 libguestfs-test-tool 2>&1 | tee android-evidence/guestfs-appliance.log
 
       - name: Configure guest boot settings without mounting its filesystem on the host
         env:
