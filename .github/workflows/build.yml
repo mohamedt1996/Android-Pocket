@@ -81,7 +81,7 @@ jobs:
 
       - name: Configure guest boot settings without mounting its filesystem on the host
         env:
-          POCKET_RESOLUTION: POCKET_RESOLUTION: ${{ inputs.resolution || '576x1024' }}
+          POCKET_RESOLUTION: ${{ inputs.resolution || '576x1024' }}
           LIBGUESTFS_BACKEND: direct
         run: |
           set -euo pipefail
